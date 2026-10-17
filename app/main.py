@@ -1,5 +1,5 @@
 from __future__ import annotations
-import os, re, sqlite3, json
+import os, re, json
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Optional
@@ -9,10 +9,117 @@ from fastapi import FastAPI, HTTPException, Header
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
+from sqlalchemy import create_engine, text
 
 load_dotenv()
 ROOT = Path(__file__).resolve().parent.parent
 DB_PATH = Path(os.getenv('CAREPILOT_DB', str(ROOT / 'carepilot.db')))
+
+# Use PostgreSQL when DATABASE_URL is configured (Render); otherwise use local SQLite.
+DATABASE_URL = os.getenv('DATABASE_URL', '').strip()
+if DATABASE_URL.startswith('postgres://'):
+    DATABASE_URL = DATABASE_URL.replace('postgres://', 'postgresql+psycopg://', 1)
+elif DATABASE_URL.startswith('postgresql://'):
+    DATABASE_URL = DATABASE_URL.replace('postgresql://', 'postgresql+psycopg://', 1)
+if not DATABASE_URL:
+    DATABASE_URL = f"sqlite:///{DB_PATH.as_posix()}"
+_is_sqlite = DATABASE_URL.startswith('sqlite:')
+_engine_kwargs = {'pool_pre_ping': True}
+if _is_sqlite:
+    _engine_kwargs['connect_args'] = {'check_same_thread': False, 'timeout': 10}
+engine = create_engine(DATABASE_URL, **_engine_kwargs)
+
+class CompatRow:
+    """Small adapter preserving sqlite3.Row-style name and positional access."""
+    def __init__(self, row):
+        mapping = row._mapping
+        self._keys = list(mapping.keys())
+        self._values = [mapping[k] for k in self._keys]
+        self._mapping = dict(zip(self._keys, self._values))
+    def __getitem__(self, key):
+        return self._mapping[key] if isinstance(key, str) else self._values[key]
+    def __iter__(self):
+        return iter(self._keys)
+    def __len__(self):
+        return len(self._keys)
+    def keys(self):
+        return self._keys
+
+class CompatCursor:
+    def __init__(self, result, lastrowid=None):
+        self._result = result
+        self.lastrowid = lastrowid
+        self.rowcount = result.rowcount
+    def fetchone(self):
+        row = self._result.fetchone()
+        return CompatRow(row) if row is not None else None
+    def fetchall(self):
+        return [CompatRow(row) for row in self._result.fetchall()]
+    def __iter__(self):
+        return iter(self.fetchall())
+
+class CompatConnection:
+    def __init__(self):
+        self._transaction = engine.begin()
+        self._connection = None
+    def __enter__(self):
+        self._connection = self._transaction.__enter__()
+        return self
+    def __exit__(self, exc_type, exc, tb):
+        return self._transaction.__exit__(exc_type, exc, tb)
+    @staticmethod
+    def _bind(sql, params):
+        if params is None or isinstance(params, dict):
+            return sql, params or {}
+        values = list(params)
+        index = 0
+        def replace(_match):
+            nonlocal index
+            key = f'p{index}'
+            index += 1
+            return ':' + key
+        converted = re.sub(r'\?', replace, sql)
+        return converted, {f'p{i}': value for i, value in enumerate(values)}
+    def execute(self, sql, params=None):
+        sql = sql.strip()
+        if sql.upper().startswith('PRAGMA '):
+            return CompatCursor(self._connection.execute(text('SELECT 1')))
+        bound_sql, bound_params = self._bind(sql, params)
+        is_insert = bool(re.match(r'INSERT\s+INTO\s+(appointments|conversations|inquiries)\b', sql, re.I))
+        if is_insert and ' RETURNING ' not in sql.upper():
+            bound_sql += ' RETURNING id'
+        result = self._connection.execute(text(bound_sql), bound_params)
+        lastrowid = None
+        if is_insert and ' RETURNING ' in bound_sql.upper():
+            inserted = result.fetchone()
+            if inserted is not None:
+                lastrowid = inserted[0]
+        return CompatCursor(result, lastrowid=lastrowid)
+    def executemany(self, sql, seq_of_params):
+        bound_sql, _ = self._bind(sql, seq_of_params[0] if seq_of_params else ())
+        if re.match(r'INSERT\s+INTO\s+(appointments|conversations|inquiries)\b', sql.strip(), re.I) and ' RETURNING ' not in sql.upper():
+            bound_sql += ' RETURNING id'
+            # executemany with RETURNING has inconsistent support across drivers; seed rows don't need ids.
+            bound_sql = bound_sql.rsplit(' RETURNING id', 1)[0]
+        converted = []
+        for params in seq_of_params:
+            _, mapping = self._bind(sql, params)
+            converted.append(mapping)
+        return CompatCursor(self._connection.execute(text(bound_sql), converted))
+    def executescript(self, script):
+        for statement in script.split(';'):
+            statement = statement.strip()
+            if not statement:
+                continue
+            if _is_sqlite:
+                self._connection.execute(text(statement))
+            else:
+                statement = re.sub(r'INTEGER\s+PRIMARY\s+KEY\s+AUTOINCREMENT', 'SERIAL PRIMARY KEY', statement, flags=re.I)
+                self._connection.execute(text(statement))
+
+def connect():
+    return CompatConnection()
+
 app = FastAPI(title='CarePilot AI', version='1.0.0', description='Safety-first clinic administration MVP')
 app.mount('/static', StaticFiles(directory=ROOT / 'static'), name='static')
 
@@ -31,13 +138,6 @@ class AppointmentInput(BaseModel):
     patient_name: str = Field(min_length=2, max_length=100)
     preferred_time: str = Field(min_length=2, max_length=100)
     reason: str = Field(min_length=2, max_length=200)
-
-
-def connect():
-    c = sqlite3.connect(DB_PATH, timeout=10)
-    c.row_factory = sqlite3.Row
-    c.execute('PRAGMA foreign_keys=ON')
-    return c
 
 
 def init_db():
@@ -139,7 +239,7 @@ async def ai_draft(message: str, intent: str) -> tuple[str, str]:
 def index(): return FileResponse(ROOT / 'static' / 'index.html')
 
 @app.get('/api/health')
-def health(): return {'status':'ok','database':'sqlite','ai_provider':'Gemini optional; safe local fallback enabled'}
+def health(): return {'status':'ok','database':engine.dialect.name,'ai_provider':'Gemini optional; safe local fallback enabled'}
 
 @app.get('/api/dashboard')
 def dashboard():
