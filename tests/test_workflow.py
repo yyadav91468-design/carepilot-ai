@@ -72,3 +72,21 @@ def test_urgent_escalation_bypasses_external_ai(monkeypatch):
     assert provider == 'Local safety fallback'
     assert 'emergency' in reply.lower()
     assert 'diagnos' not in reply.lower()
+
+
+def test_staff_can_reschedule_appointment(client):
+    created = client.post('/api/appointments', json={
+        'patient_name': 'Demo Patient',
+        'preferred_time': 'October 20, 2026 at 10:00 AM',
+        'reason': 'Routine consultation'
+    }).json()['appointment']
+
+    response = client.patch(
+        f"/api/appointments/{created['id']}/reschedule",
+        json={'preferred_time': 'October 22, 2026 at 11:30 AM'}
+    )
+
+    assert response.status_code == 200
+    assert response.json()['appointment']['preferred_time'] == (
+        'October 22, 2026 at 11:30 AM'
+    )

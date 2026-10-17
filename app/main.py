@@ -131,6 +131,11 @@ class ChatInput(BaseModel):
 class StatusInput(BaseModel):
     status: str
 
+
+class RescheduleInput(BaseModel):
+    preferred_time: str
+
+
 class InquiryReview(BaseModel):
     response: str = Field(min_length=1, max_length=1500)
 
@@ -298,18 +303,85 @@ def create_appointment(body: AppointmentInput):
         row = dict(c.execute('SELECT * FROM appointments WHERE id=?',(cur.lastrowid,)).fetchone())
     return {'appointment':row,'message':f"Request created as Pending. Reference CP-{row['id']:04d}."}
 
+
 @app.patch('/api/appointments/{appointment_id}')
-def update_appointment(appointment_id: int, body: StatusInput, x_admin_passcode: Optional[str] = Header(default=None)):
-    if body.status not in {'Pending','Confirmed','Cancelled'}: raise HTTPException(400,'Status must be Pending, Confirmed, or Cancelled')
-    required = os.getenv('ADMIN_DEMO_PASSCODE','').strip()
+def update_appointment(
+    appointment_id: int,
+    body: StatusInput,
+    x_admin_passcode: Optional[str] = Header(default=None)
+):
+    if body.status not in {'Pending', 'Confirmed', 'Cancelled'}:
+        raise HTTPException(
+            400,
+            'Status must be Pending, Confirmed, or Cancelled'
+        )
+
+    required = os.getenv('ADMIN_DEMO_PASSCODE', '').strip()
     if required and required != 'change-this-before-deploying' and x_admin_passcode != required:
-        raise HTTPException(401,'Admin passcode required')
+        raise HTTPException(401, 'Admin passcode required')
+
     now = datetime.now().isoformat(timespec='seconds')
+
     with connect() as c:
-        cur = c.execute('UPDATE appointments SET status=?,updated_at=? WHERE id=?',(body.status,now,appointment_id))
-        if not cur.rowcount: raise HTTPException(404,'Appointment not found')
-        row = dict(c.execute('SELECT * FROM appointments WHERE id=?',(appointment_id,)).fetchone())
-    return {'appointment':row,'message':f"Appointment status updated to {body.status}"}
+        cur = c.execute(
+            'UPDATE appointments SET status=?, updated_at=? WHERE id=?',
+            (body.status, now, appointment_id)
+        )
+
+        if not cur.rowcount:
+            raise HTTPException(404, 'Appointment not found')
+
+        row = dict(
+            c.execute(
+                'SELECT * FROM appointments WHERE id=?',
+                (appointment_id,)
+            ).fetchone()
+        )
+
+    return {
+        'appointment': row,
+        'message': f"Appointment status updated to {body.status}"
+    }
+
+
+@app.patch('/api/appointments/{appointment_id}/reschedule')
+def reschedule_appointment(
+    appointment_id: int,
+    body: RescheduleInput,
+    x_admin_passcode: Optional[str] = Header(default=None)
+):
+    preferred_time = body.preferred_time.strip()
+
+    if not preferred_time:
+        raise HTTPException(400, 'A new appointment date and time is required')
+
+    required = os.getenv('ADMIN_DEMO_PASSCODE', '').strip()
+    if required and required != 'change-this-before-deploying' and x_admin_passcode != required:
+        raise HTTPException(401, 'Admin passcode required')
+
+    now = datetime.now().isoformat(timespec='seconds')
+
+    with connect() as c:
+        cur = c.execute(
+            'UPDATE appointments SET preferred_time=?, updated_at=? WHERE id=?',
+            (preferred_time, now, appointment_id)
+        )
+
+        if not cur.rowcount:
+            raise HTTPException(404, 'Appointment not found')
+
+        row = dict(
+            c.execute(
+                'SELECT * FROM appointments WHERE id=?',
+                (appointment_id,)
+            ).fetchone()
+        )
+
+    return {
+        'appointment': row,
+        'message': 'Appointment date/time updated successfully'
+    }
+
 
 @app.post('/api/inquiries/{inquiry_id}/send')
 def send_inquiry(inquiry_id: int, body: InquiryReview):
